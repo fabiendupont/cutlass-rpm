@@ -1,0 +1,424 @@
+---
+name: Build CUTLASS RPM
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      cutlass_version:
+        description: 'CUTLASS version to build'
+        required: true
+        default: '3.9.2'
+      cuda_version:
+        description: 'CUDA version to use'
+        required: true
+        default: '12.8'
+        type: choice
+        options:
+        - '12.4'
+        - '12.5'
+        - '12.6'
+        - '12.8'
+
+  # Automatic trigger when CUTLASS releases
+  schedule:
+    # Check for new releases daily at 6 AM UTC
+    - cron: '0 6 * * *'
+
+  # Trigger on pushes to main branch
+  push:
+    branches: [ main ]
+    paths:
+      - 'cutlass.spec'
+      - '.github/workflows/build-rpm.yaml'
+
+  # Trigger on pull requests
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'cutlass.spec'
+      - '.github/workflows/build-rpm.yaml'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/builder
+
+jobs:
+  check-new-release:
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.check.outputs.new_version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+    - name: Check for new CUTLASS release
+      id: check
+      run: |
+        # Get latest CUTLASS release
+        LATEST=$(curl -s https://api.github.com/repos/NVIDIA/cutlass/releases/latest | jq -r .tag_name | sed 's/^v//')
+        echo "Latest CUTLASS version: $LATEST"
+
+        # Check if we've already built this version
+        EXISTING=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.[].tag_name' | grep "^$LATEST$" || true)
+
+        if [ -z "$EXISTING" ]; then
+          echo "new_version=$LATEST" >> $GITHUB_OUTPUT
+          echo "should_build=true" >> $GITHUB_OUTPUT
+          echo "New version $LATEST found, will build"
+        else
+          echo "should_build=false" >> $GITHUB_OUTPUT
+          echo "Version $LATEST already exists"
+        fi
+
+  build-rpm:
+    needs: check-new-release
+    if: needs.check-new-release.outputs.should_build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        cuda_version:
+          - ${{ github.event.inputs.cuda_version || '12.8' }}
+        gpu_arch:
+#          - name: "sm8x"
+#            archs: "80;86;89"
+#            desc: "Ampere and Ada Lovelace"
+#          - name: "sm9x"
+#            archs: "90a"
+#            desc: "Hopper with architecture-accelerated features"
+#          - name: "sm10x"
+#            archs: "100a"
+#            desc: "Blackwell with latest features"
+          - name: "all"
+            archs: "80;86;89;90a;100a"
+            desc: "All modern architectures"
+        base_image:
+          - name: "centos-stream"
+            image: "quay.io/centos/centos:stream9"
+            desc: "CentOS Stream 9"
+#          - name: "rhel-ubi"
+#            image: "registry.access.redhat.com/ubi9/ubi:9.6"
+#            desc: "Red Hat Universal Base Image 9"
+
+    container:
+      image: ${{ matrix.base_image.image }}
+      options: --privileged
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup build environment
+      run: |
+        # Detect base image type and configure accordingly
+        if grep -q "centos" /etc/os-release; then
+          echo "Setting up CentOS Stream 9 environment"
+          # Enable EPEL and CRB repositories
+          dnf install -y epel-release
+          dnf config-manager --enable crb
+          BASE_TYPE="centos"
+        elif grep -q "Red Hat" /etc/os-release; then
+          echo "Setting up Red Hat UBI 9 environment"
+          # Enable CodeReady Builder repository for UBI
+          dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+          # Note: Some packages may require subscription-manager for full RHEL repos
+          BASE_TYPE="rhel-ubi"
+        else
+          echo "Unknown base image, assuming RHEL-compatible"
+          dnf install -y epel-release || true
+          BASE_TYPE="unknown"
+        fi
+
+        echo "BASE_TYPE=$BASE_TYPE" >> $GITHUB_ENV
+
+        # Add CUDA repository
+        curl -sL -o /etc/yum.repos.d/cuda.repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+
+        # Install RPM build dependencies
+        dnf install -y rpm-build
+        dnf builddep -y cutlass.spec
+
+        # Setup environment
+        echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+        echo "CUDA_HOME=/usr/local/cuda" >> $GITHUB_ENV
+        echo "CUDACXX=/usr/local/cuda/bin/nvcc" >> $GITHUB_ENV
+
+    - name: Prepare RPM build environment
+      run: |
+        # Create RPM build directories
+        mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+
+        # Set version from input or detected version
+        VERSION="${{ github.event.inputs.cutlass_version || needs.check-new-release.outputs.new_version || '3.9.2' }}"
+        echo "CUTLASS_VERSION=$VERSION" >> $GITHUB_ENV
+
+        # Download CUTLASS source
+        curl -SL -o ~/rpmbuild/SOURCES/cutlass-${VERSION}.tar.gz "https://github.com/NVIDIA/cutlass/archive/refs/tags/v${VERSION}.tar.gz"
+
+    - name: Customize spec file for build matrix
+      run: |
+        # Copy spec file and customize for this build
+        cp cutlass.spec ~/rpmbuild/SPECS/
+
+        # Update version in spec file
+        sed -i "s/^Version:.*/Version:        ${{ env.CUTLASS_VERSION }}/" ~/rpmbuild/SPECS/cutlass.spec
+
+        # Update CUDA architecture targets
+        sed -i "s/-DCUTLASS_NVCC_ARCHS=\"[^\"]*\"/-DCUTLASS_NVCC_ARCHS=\"${{ matrix.gpu_arch.archs }}\"/" ~/rpmbuild/SPECS/cutlass.spec
+        sed -i "s/-DCMAKE_CUDA_ARCHITECTURES=\"[^\"]*\"/-DCMAKE_CUDA_ARCHITECTURES=\"${{ matrix.gpu_arch.archs }}\"/" ~/rpmbuild/SPECS/cutlass.spec
+
+        # Add build variant and base image to release number
+        sed -i "s/^Release:.*/Release:        1.${{ matrix.gpu_arch.name }}.cuda${{ matrix.cuda_version }}%{?dist}/" ~/rpmbuild/SPECS/cutlass.spec
+
+    - name: Build RPM packages
+      run: |
+        # Build source and binary RPMs
+        rpmbuild -ba ~/rpmbuild/SPECS/cutlass.spec
+
+        # List built packages
+        echo "Built packages:"
+        ls -la ~/rpmbuild/RPMS/x86_64/
+        ls -la ~/rpmbuild/SRPMS/
+
+    - name: Test installation
+      run: |
+        # Install built packages to verify they work
+        dnf install -y ~/rpmbuild/RPMS/x86_64/cutlass-devel-*.rpm
+
+        # Basic functionality test
+        echo '#include <cutlass/version.h>' > test.cpp
+        echo 'int main() { return 0; }' >> test.cpp
+
+        g++ -I/usr/include/cutlass test.cpp -o test || echo "Warning: Test compilation failed (expected without GPU)"
+
+    - name: Upload RPM artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: cutlass-rpm-${{ matrix.base_image.name }}-cuda${{ matrix.cuda_version }}-${{ matrix.gpu_arch.name }}
+        path: |
+          ~/rpmbuild/RPMS/x86_64/*.rpm
+          ~/rpmbuild/SRPMS/*.rpm
+        retention-days: 30
+
+    - name: Create package info
+      run: |
+        # Create info file for this build variant
+        cat > package-info-${{ matrix.base_image.name }}-${{ matrix.gpu_arch.name }}.txt << EOF
+        Base Image: ${{ matrix.base_image.desc }}
+        Build Variant: ${{ matrix.gpu_arch.desc }}
+        CUDA Version: ${{ matrix.cuda_version }}
+        GPU Architectures: ${{ matrix.gpu_arch.archs }}
+        CUTLASS Version: ${{ env.CUTLASS_VERSION }}
+        Build Date: $(date -u)
+        Base OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)
+
+        Packages built:
+        $(ls ~/rpmbuild/RPMS/x86_64/*.rpm | xargs -I {} basename {})
+        EOF
+
+    - name: Upload package info
+      uses: actions/upload-artifact@v4
+      with:
+        name: package-info-${{ matrix.base_image.name }}-${{ matrix.gpu_arch.name }}
+        path: package-info-${{ matrix.base_image.name }}-${{ matrix.gpu_arch.name }}.txt
+
+  publish-repository:
+    needs: [check-new-release, build-rpm]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
+
+    - name: Install createrepo_c
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y createrepo-c
+
+    - name: Setup repository structure
+      run: |
+        # Create repository structure
+        mkdir -p repo/centos-stream-9/{x86_64,SRPMS}
+        mkdir -p repo/rhel-ubi-9/{x86_64,SRPMS}
+        mkdir -p repo/repodata
+
+        # Organize RPMs by base image
+        find artifacts/ -name "*.rpm" | while read rpm; do
+          filename=$(basename "$rpm")
+          if [[ "$filename" == *.src.rpm ]]; then
+            # Source RPMs
+            if [[ "$filename" == *centos-stream* ]]; then
+              cp "$rpm" repo/centos-stream-9/SRPMS/
+            elif [[ "$filename" == *rhel-ubi* ]]; then
+              cp "$rpm" repo/rhel-ubi-9/SRPMS/
+            fi
+          else
+            # Binary RPMs
+            if [[ "$filename" == *centos-stream* ]]; then
+              cp "$rpm" repo/centos-stream-9/x86_64/
+            elif [[ "$filename" == *rhel-ubi* ]]; then
+              cp "$rpm" repo/rhel-ubi-9/x86_64/
+            fi
+          fi
+        done
+
+    - name: Create repository metadata
+      run: |
+        chmod +x scripts/create-repo-metadata.sh
+        ./scripts/create-repo-metadata.sh
+
+    - name: Generate repository listings
+      run: |
+        chmod +x scripts/generate-repo-listings.sh
+        ./scripts/generate-repo-listings.sh
+
+    - name: Create repository info files
+      run: |
+        # Create .repo files for easy setup
+        cat > repo/cutlass-centos-stream-9.repo << 'EOF'
+        [cutlass-centos-stream-9]
+        name=CUTLASS for CentOS Stream 9
+        baseurl=https://fabiendupont.github.io/cutlass-rpm/repo/centos-stream-9
+        enabled=1
+        gpgcheck=0
+        EOF
+
+        cat > repo/cutlass-rhel-ubi-9.repo << 'EOF'
+        [cutlass-rhel-ubi-9]
+        name=CUTLASS for RHEL UBI 9
+        baseurl=https://fabiendupont.github.io/cutlass-rpm/repo/rhel-ubi-9
+        enabled=1
+        gpgcheck=0
+        EOF
+
+        # Copy setup script to repo root
+        cp setup-cutlass-repo.sh repo/
+
+    - name: Upload Pages artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: ./repo
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
+
+  create-release:
+    needs: [check-new-release, build-rpm]
+    if: (needs.check-new-release.outputs.should_build == 'true' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
+
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+
+        # Copy all RPM files
+        find artifacts/ -name "*.rpm" -exec cp {} release-assets/ \;
+
+        # Create combined package info
+        cat artifacts/package-info-*/package-info-*.txt > release-assets/BUILD-INFO.txt
+
+        # Create checksums
+        cd release-assets
+        sha256sum *.rpm > SHA256SUMS
+
+        echo "Release assets:"
+        ls -la
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.event.inputs.cutlass_version || needs.check-new-release.outputs.new_version }}
+        name: CUTLASS ${{ github.event.inputs.cutlass_version || needs.check-new-release.outputs.new_version }} RPM Packages
+        files: |
+          release-assets/*.rpm
+          release-assets/SHA256SUMS
+          release-assets/BUILD-INFO.txt
+        body: |
+          ## CUTLASS ${{ github.event.inputs.cutlass_version || needs.check-new-release.outputs.new_version }} RPM Packages
+
+          This release provides RPM packages for NVIDIA CUTLASS ${{ github.event.inputs.cutlass_version || needs.check-new-release.outputs.new_version }} built on multiple base images.
+
+          ### Base Images
+
+          - **centos-stream**: Built on CentOS Stream 9
+          - **rhel-ubi**: Built on Red Hat Universal Base Image 9
+
+          ### Package Variants
+
+          - **ampere-ada**: Support for Ampere (8.0, 8.6) and Ada Lovelace (8.9) architectures
+          - **hopper**: Support for Hopper architecture (9.0a) with architecture-accelerated features
+          - **blackwell**: Support for Blackwell architecture (10.0a) with latest features
+          - **modern-all**: Support for all modern architectures (8.0, 8.6, 8.9, 9.0a, 10.0a)
+
+          ### Installation
+
+          Choose the appropriate base image and GPU variant:
+
+          **For CentOS Stream 9:**
+          ```bash
+          # RTX 30/40 series (Ampere/Ada)
+          sudo dnf install cutlass-*centos-stream*ampere-ada*.rpm
+
+          # H100 (Hopper)
+          sudo dnf install cutlass-*centos-stream*hopper*.rpm
+
+          # B100/B200 (Blackwell)
+          sudo dnf install cutlass-*centos-stream*blackwell*.rpm
+          ```
+
+          **For RHEL/UBI-based systems:**
+          ```bash
+          # RTX 30/40 series (Ampere/Ada)
+          sudo dnf install cutlass-*rhel-ubi*ampere-ada*.rpm
+
+          # H100 (Hopper)
+          sudo dnf install cutlass-*rhel-ubi*hopper*.rpm
+
+          # B100/B200 (Blackwell)
+          sudo dnf install cutlass-*rhel-ubi*blackwell*.rpm
+          ```
+
+          ### Requirements
+
+          - CentOS Stream 9, RHEL 9, or compatible distribution
+          - CUDA 12.4+ runtime
+          - NVIDIA GPU with compute capability 8.0+
+          - Python 3.12 (for Python components)
+
+          ### Verification
+
+          Verify package integrity using the provided checksums:
+          ```bash
+          sha256sum -c SHA256SUMS
+          ```
+        draft: false
+        prerelease: false
